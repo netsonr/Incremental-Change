@@ -1,0 +1,212 @@
+---
+title: "Increment_Autism_MSEC"
+author: "Rebecca Netson"
+date: "7/9/2021"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(readxl)
+library(writexl)
+library(dplyr)
+library(tidyverse)
+library(ggplot2)
+library(tidyr)
+library(tibble)
+library(data.table)
+library(tidyquant)
+library(roll)
+library(zoo)
+```
+
+Loading in longitudinal autism data
+```{r setup, include=FALSE}
+mita.db.compl.new.data = read_excel("~/Autism/longitudinal_autism_data.xlsx", col_names = TRUE)
+dim(mita.db.compl.new.data)
+colnames(mita.db.compl.new.data)
+
+mita.atec.combined.compl.new.data = mita.db.compl.new.data
+colnames(mita.atec.combined.compl.new.data)
+print(paste("Original ", length(unique(mita.atec.combined.compl.new.data$User_ID)), " unique subjects left", sep = ''))
+
+mita.atec.combined.compl.new.data = mita.atec.combined.compl.new.data[mita.atec.combined.compl.new.data$Treatment == 1 | mita.atec.combined.compl.new.data$Treatment == 0,]
+print(paste("After filtered out Treatment that is neither 0 nor 1: ", length(unique(mita.atec.combined.compl.new.data$User_ID)), " unique subjects left", sep = ''))
+
+#Filtering out for screentime either 1 or 0
+mita.atec.combined.compl.new.data = mita.atec.combined.compl.new.data[mita.atec.combined.compl.new.data$`TVtime quartiles zero if 50 min or less; 1 if 120min or more` == 1 | mita.atec.combined.compl.new.data$`TVtime quartiles zero if 50 min or less; 1 if 120min or more` == 0,]
+print(paste("After filtered out Screentime that is neither 0 nor 1: ", length(unique(mita.atec.combined.compl.new.data$User_ID)), " unique subjects left", sep = ''))
+
+
+i <- c(23:28, 11, 12, 19)
+mita.atec.combined.compl.new.data[, i] <- apply(mita.atec.combined.compl.new.data[, i], 2,
+                                                function(x) as.numeric(x))
+sapply(mita.atec.combined.compl.new.data, class)
+mita.atec.combined.compl.new.data = mita.atec.combined.compl.new.data[complete.cases(mita.atec.combined.compl.new.data),]
+print(paste("After removes incomplete records IN ANY COLUMN: ", length(unique(mita.atec.combined.compl.new.data$User_ID)), " unique subjects left", sep = ''))
+```
+
+Propensity matching for Visit 1
+```{r setup, include=FALSE}
+mita.atec.combined.compl.new.data.visit1 = mita.atec.combined.compl.new.data[mita.atec.combined.compl.new.data$Visit == 1,]
+#dim(mita.atec.combined.compl.new.data.visit1)
+
+
+atec.mita.new.matched.samples = matchit(as.logical(mita.atec.combined.compl.new.data.visit1$Treatment) ~
+                                            as.numeric(mita.atec.combined.compl.new.data.visit1$BL_Scale1) +
+                                            as.numeric(mita.atec.combined.compl.new.data.visit1$BL_Scale2) +
+                                            as.numeric(mita.atec.combined.compl.new.data.visit1$BL_Scale3) +
+                                            as.numeric(mita.atec.combined.compl.new.data.visit1$BL_Scale4) +
+                                            as.numeric(mita.atec.combined.compl.new.data.visit1$BL_MSEC) +
+                                            as.numeric(mita.atec.combined.compl.new.data.visit1$Gender) +
+                                            as.numeric(mita.atec.combined.compl.new.data.visit1$AgeAtBaseline),
+                                          data=mita.atec.combined.compl.new.data.visit1, method = "nearest", discard = "both")
+
+mita.atec.new.matched.combined.subset = match.data(atec.mita.new.matched.samples)
+print(paste("Size of a propensity score matched set is: ", dim(mita.atec.new.matched.combined.subset), sep=''))
+matched.subjects = unique(mita.atec.new.matched.combined.subset$User_ID)
+mita.atec.combined.compl.new.data.reduced = mita.atec.combined.compl.new.data[mita.atec.combined.compl.new.data$User_ID %in% matched.subjects,]
+old.matched.subjects = unique(mita.atec.combined.compl.new.data.reduced$User_ID)
+sum(mita.atec.new.matched.combined.subset$Treatment == 1)#number of treatment 
+sum(mita.atec.new.matched.combined.subset$Treatment == 0)#number of controls
+  
+  # Making matched reduced set
+mita.atec.new.matched.combined.subset = mita.atec.combined.compl.new.data.reduced  #with 2928 controls and 2928 cases
+write_xlsx(mita.atec.new.matched.combined.subset, "mita.atec.new.matched.combined.subset.xlsx")
+```
+
+Matched data is new data set 
+```{r setup, include=FALSE}
+df <- read_excel("~/Autism/mita.atec.new.matched.combined.subset.xlsx") #5856 unique users
+df$ScreenTime = as.factor(df$`TVtime quartiles zero if 50 min or less; 1 if 120min or more`)
+#df$Age_Rounded = as.integer(df$Age_Rounded)
+#df$Subjects = df$User_ID
+#df$Endpoint_MSEC = df$MSEC
+#df$Baseline_MSEC = df$BL_MSEC
+```
+Creating sequential series for modeling 
+```{r}
+df$Visit = as.Date(df$Visit) #(treating Visits as dates)
+summary(df$Visit)
+```
+Splitting the data frame into users by creating lists within the data frame 
+```{r}
+df_subset = subset(df, select = c(User_ID, Visit, MSEC, BL_MSEC, Gender, Language, Severity, ScreenTime)) #Subsetting only the columns needed for model
+df_subset$difference = df_subset$MSEC - df_subset$BL_MSEC #Difference from Baseline to Endpoint of each scoring 
+
+#Creating a nested dataframe
+by_user <- df_subset %>% 
+  group_by(User_ID) %>%
+  nest()
+#Interpolating
+df_subset <- df_subset %>%
+  complete(nesting(User_ID,ScreenTime), Visit)
+#Computing moving average for only consecutive visits per user
+df_subset <- df_subset %>%
+  group_by(User_ID) %>%
+  mutate(moving_average_actual = rollapplyr(difference, 2, mean, fill=NA))
+df_subset <- df_subset[complete.cases(df_subset),]
+df_subset %>% group_by(Visit)
+head(df_subset)
+df_subset$User_ID <- as.factor(df_subset$User_ID)
+#Graphing incremental change 
+#p <- ggplot(data = df_subset, aes(x = Visit, y = moving_average_actual))+geom_point()
+#p
+
+```
+
+
+
+```{r}
+#Finding the average of the incremental average per visit across all users
+df_visits <- aggregate(moving_average_actual ~ Visit, df_subset,mean)
+df_visits
+
+Visit_time_series <- df_visits %>%
+  ggplot(aes(x = Visit, y = moving_average_actual))+geom_line() + geom_ma(ma_fun = SMA, n=11)
+Visit_time_series
+
+all_user_averages = aggregate(df_subset[, "moving_average_actual"], list(df_subset$Visit), mean)
+```
+
+
+Without imputation - group by low or high screentime
+```{r}
+df_subset_low = df_subset[df_subset$ScreenTime == 0, ]
+df_subset_high = df_subset[df_subset$ScreenTime == 1, ]
+
+#for low screen time users
+mean_low = df_subset_low %>%
+  group_by(Visit)%>%
+  summarise(avg = mean(moving_average_actual, na.rm = TRUE))
+ggplot(mean_low, aes(x = Visit, y = avg))+geom_point() 
+#lm.low <- lm(moving_average_actual ~ Visit, data = df_subset_low)
+#plot(lm.low)
+p <- ggplot(df_subset_low, aes(x = Visit, y = moving_average_actual)) + geom_line()
+p
+
+
+#for high screen time users 
+mean_high = df_subset_high %>%
+  group_by(Visit) %>%
+  summarise(avg = mean(moving_average_actual, na.rm = TRUE))
+
+q <- ggplot(df_subset_high, aes(x = Visit, y = moving_average_actual)) + geom_point()+geom_line()
+
+
+#mean_average <- df_subset %>%
+  group_by(Visit)%>%
+  summarize(mean = mean(moving_average_actual, na.rm = TRUE ))
+
+#all users with color for the factor of screentime 
+df_subset$ScreenTime = as.factor(df_subset$ScreenTime)
+ggplot(df_subset, aes(x = Visit, y = moving_average_actual, color = ScreenTime)) + geom_point()
+```
+
+
+```{r}
+mean_high$screentime = rep(1, 12)
+mean_low$screentime = rep(0,12)
+not_imputed <- data.frame(mean_high$Visit, mean_high$avg, mean_low$avg, mean_low$screentime, mean_low$screentime)
+not_imputed
+```
+
+
+Imputation for missing visit values, MSEC values and BL_MSEC values
+For low screentime users
+```{r}
+library(mice)
+df_SLMiss <- df_subset_low %>%
+  complete(nesting(User_ID,ScreenTime), Visit)
+df_SLMiss <- subset(df_SLMiss, select = c(Visit, User_ID, BL_MSEC, MSEC))
+df_SLImp <- mice(df_SLMiss, m = 3, method = "rf") #random forest impuation
+
+complete_df_SLimp <- complete(df_SLImp, 1) #complete imputed dataest for low screentime users 
+complete_df_SLimp$difference = complete_df_SLimp$MSEC - complete_df_SLimp$BL_MSEC #difference in MSEC Scores
+complete_df_SLimp <- complete_df_SLimp %>% 
+  group_by(User_ID) %>%
+  mutate(moving_average_actual = rollapplyr(difference, 2, mean, fill=NA)) #Moving average
+
+ 
+complete_df_SLimp = aggregate(complete_df_SLimp[, "moving_average_actual"], list(complete_df_SLimp$Visit), mean, na.rm = TRUE)
+plot(complete_df_SLimp$Group.1, complete_df_SLimp$moving_average_actual, na.rm = TRUE)
+ggplot(complete_df_SLimp, aes(x = Group.1, y = moving_average_actual)) + geom_point(na.rm = FALSE) + geom_line() + xlab("Visit") + ylab("Moving Average") + scale_x_continuous(limits = (c(1, 13)))
+```
+
+Imputation for missing visit values, MSEC values and BL_MSEC values 
+For high screentime users
+```{r}
+df_SHMiss <- df_subset_high %>% complete(nesting(User_ID,ScreenTime), Visit)
+df_SHMiss <- subset(df_SHMiss, select = c(Visit, User_ID, BL_MSEC, MSEC))
+df_SHImp <- mice(df_SHMiss, m = 3, method = "rf")
+
+
+complete_df_SHimp <- complete(df_SHimp, 1) #complete imputed dataest for low screentime users 
+complete_df_SHimp$difference = complete_df_SHimp$MSEC - complete_df_SHimp$BL_MSEC #difference in MSEC Scores
+complete_df_SHimp <- complete_df_SHimp %>% 
+  group_by(User_ID) %>%
+  mutate(moving_average_actual = rollapplyr(difference, 2, mean, fill=NA)) #Moving average
+
+```
+
+
